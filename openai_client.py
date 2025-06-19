@@ -177,25 +177,261 @@ class OpenAIClient:
         """
         text = self.extract_text(response)
         
-        # JSONを抽出
-        try:
-            # JSONブロックを探す
-            json_start = text.find("{")
-            json_end = text.rfind("}") + 1
+        if not text.strip():
+            logger.warning("レスポンステキストが空です。")
+            return {}
+        
+        # JSONを抽出する複数の方法を試行
+        json_candidates = []
+        
+        # 方法1: ```json ブロックを探す
+        import re
+        json_blocks = re.findall(r'```json\s*\n(.*?)\n```', text, re.DOTALL)
+        json_candidates.extend(json_blocks)
+        
+        # 方法2: ``` ブロック内のJSONを探す
+        code_blocks = re.findall(r'```\s*\n(.*?)\n```', text, re.DOTALL)
+        for block in code_blocks:
+            block = block.strip()
+            if block.startswith('{') and block.endswith('}'):
+                json_candidates.append(block)
+        
+        # 方法3: 完全なJSONオブジェクトを探す（ネストした括弧を考慮）
+        def find_complete_json(text):
+            """完全なJSONオブジェクトを見つける"""
+            results = []
+            i = 0
+            while i < len(text):
+                if text[i] == '{':
+                    brace_count = 0
+                    start = i
+                    in_string = False
+                    escape_next = False
+                    
+                    for j in range(i, len(text)):
+                        char = text[j]
+                        
+                        if escape_next:
+                            escape_next = False
+                            continue
+                        
+                        if char == '\\':
+                            escape_next = True
+                            continue
+                        
+                        if char == '"' and not escape_next:
+                            in_string = not in_string
+                        elif not in_string:
+                            if char == '{':
+                                brace_count += 1
+                            elif char == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    json_str = text[start:j+1]
+                                    results.append(json_str)
+                                    i = j + 1
+                                    break
+                    else:
+                        break
+                else:
+                    i += 1
+            return results
+        
+        complete_jsons = find_complete_json(text)
+        json_candidates.extend(complete_jsons)
+        
+        # 方法4: 単純な最初と最後の括弧（フォールバック）
+        json_start = text.find("{")
+        json_end = text.rfind("}") + 1
+        if json_start >= 0 and json_end > json_start:
+            json_candidates.append(text[json_start:json_end])
+        
+        # 各候補を試してパースする
+        for i, json_str in enumerate(json_candidates):
+            json_str = json_str.strip()
+            if not json_str:
+                continue
             
-            if json_start >= 0 and json_end > json_start:
-                json_str = text[json_start:json_end]
-                return json.loads(json_str)
-            else:
-                logger.warning("JSONが見つかりませんでした。")
-                return {}
+            # JSON文字列の前処理（よくある問題を修正）
+            json_str = self._preprocess_json_string(json_str)
+            
+            try:
+                parsed_json = json.loads(json_str)
+                logger.debug(f"JSON抽出成功（方法{i+1}）")
+                return parsed_json
                 
-        except json.JSONDecodeError as e:
-            logger.error(f"JSONのデコードに失敗しました: {e}")
-            return {}
-        except Exception as e:
-            logger.error(f"JSONの抽出中に予期しないエラーが発生しました: {e}")
-            return {}
+            except json.JSONDecodeError as e:
+                logger.debug(f"JSON候補{i+1}のパースに失敗: {e}")
+                
+                # 追加の修正を試行
+                try:
+                    fixed_json = self._aggressive_json_fix(json_str)
+                    parsed_json = json.loads(fixed_json)
+                    logger.debug(f"JSON修正後に抽出成功（方法{i+1}）")
+                    return parsed_json
+                except:
+                    pass
+                
+                # デバッグ用に問題のある部分を表示
+                if len(json_str) > 200:
+                    logger.debug(f"問題のあるJSON（最初の200文字）: {json_str[:200]}...")
+                else:
+                    logger.debug(f"問題のあるJSON: {json_str}")
+                continue
+            except Exception as e:
+                logger.debug(f"JSON候補{i+1}の処理中にエラー: {e}")
+                continue
+        
+        # すべての方法が失敗した場合
+        logger.error("すべてのJSON抽出方法が失敗しました。")
+        logger.debug(f"元のレスポンステキスト（最初の500文字）: {text[:500]}...")
+        
+        # 空のJSONを返す
+        return {}
+    
+    def _preprocess_json_string(self, json_str: str) -> str:
+        """
+        JSON文字列の前処理を行い、よくある問題を修正する
+        
+        Args:
+            json_str: 元のJSON文字列
+            
+        Returns:
+            str: 前処理されたJSON文字列
+        """
+        import re
+        
+        # 1. 末尾のカンマを削除
+        json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
+        
+        # 2. 不正な改行を修正
+        json_str = re.sub(r'\n\s*([,}\]])', r'\1', json_str)
+        
+        # 3. 重複した引用符を修正
+        json_str = re.sub(r'"""([^"]*)"', r'"\1"', json_str)  # """text" -> "text"
+        json_str = re.sub(r'"([^"]*)""+', r'"\1"', json_str)  # "text"" -> "text"
+        
+        # 4. 配列の開始記号の修正
+        json_str = re.sub(r':\s*"\[', r': [', json_str)  # ": "[" -> ": ["
+        json_str = re.sub(r':\s*\["\s*{', r': [{', json_str)  # ": [" {" -> ": [{"
+        
+        # 5. 引用符で囲まれていない文字列値を修正（慎重に処理）
+        def fix_unquoted_values(match):
+            key = match.group(1)
+            value = match.group(2).strip()
+            
+            # 既に引用符で囲まれている場合はそのまま
+            if value.startswith('"') and value.endswith('"'):
+                return match.group(0)
+            
+            # 数値、boolean、null、配列、オブジェクトの場合はそのまま
+            if (value in ['true', 'false', 'null'] or
+                re.match(r'^-?\d+(\.\d+)?$', value) or
+                value.startswith('[') or value.startswith('{')):
+                return match.group(0)
+            
+            # その他の場合は引用符で囲む
+            return f'"{key}": "{value}"'
+        
+        # パターンマッチングで修正（より慎重に）
+        json_str = re.sub(r'"([^"]+)":\s*([^",}\]\n\[{]+)', fix_unquoted_values, json_str)
+        
+        # 6. 文字列内のエスケープが必要な文字を処理
+        def fix_string_content(match):
+            content = match.group(1)
+            # 既にエスケープされている場合は重複エスケープを避ける
+            if '\\' in content:
+                return match.group(0)
+            
+            # 制御文字をエスケープ
+            content = content.replace('\n', '\\n')
+            content = content.replace('\r', '\\r')
+            content = content.replace('\t', '\\t')
+            return f'"{content}"'
+        
+        # 文字列値のみを対象にエスケープ処理
+        def escape_newlines(match):
+            content = match.group(1)
+            content = content.replace(chr(10), "\\n")
+            content = content.replace(chr(13), "\\r")
+            content = content.replace(chr(9), "\\t")
+            return f': "{content}"'
+        
+        json_str = re.sub(r':\s*"([^"]*[\n\r\t][^"]*)"', escape_newlines, json_str)
+        
+        return json_str
+    
+    def _aggressive_json_fix(self, json_str: str) -> str:
+        """
+        より積極的なJSON修正を行う
+        
+        Args:
+            json_str: 修正対象のJSON文字列
+            
+        Returns:
+            str: 修正されたJSON文字列
+        """
+        import re
+        
+        # 1. 重複引用符の問題を修正
+        # """text" -> "text"
+        json_str = re.sub(r'"{2,}([^"]*)"', r'"\1"', json_str)
+        
+        # 2. 配列記号の問題を修正
+        # "segments": "[" -> "segments": [
+        json_str = re.sub(r':\s*"\[', r': [', json_str)
+        json_str = re.sub(r':\s*\]"', r': ]', json_str)
+        
+        # 3. オブジェクト記号の問題を修正
+        # "segments": "[" { -> "segments": [ {
+        json_str = re.sub(r':\s*"\[\s*"?\s*{', r': [{', json_str)
+        
+        # 4. 文字列値の前後の不正な引用符を修正
+        # "key": ""value"" -> "key": "value"
+        json_str = re.sub(r':\s*"+"([^"]*)"+"', r': "\1"', json_str)
+        
+        # 5. 配列内の要素の修正
+        # [ "{ -> [{
+        json_str = re.sub(r'\[\s*"{\s*', r'[{', json_str)
+        # }" ] -> }]
+        json_str = re.sub(r'}\s*"\s*\]', r'}]', json_str)
+        
+        # 6. 行の途中で切れた文字列を修正
+        lines = json_str.split('\n')
+        fixed_lines = []
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+                
+            # 引用符で始まって終わらない行を検出
+            if line.count('"') % 2 == 1 and not line.endswith(',') and not line.endswith('{') and not line.endswith('['):
+                # 次の行と結合を試みる
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
+                    if next_line and not next_line.startswith('"') and not next_line.startswith('}') and not next_line.startswith(']'):
+                        line = line + ' ' + next_line
+                        lines[i + 1] = ''  # 次の行をスキップ
+            
+            fixed_lines.append(line)
+        
+        json_str = '\n'.join(fixed_lines)
+        
+        # 7. 最終的な構文チェックと修正
+        # 不完全な配列やオブジェクトを検出して修正
+        open_braces = json_str.count('{')
+        close_braces = json_str.count('}')
+        open_brackets = json_str.count('[')
+        close_brackets = json_str.count(']')
+        
+        # 不足している閉じ括弧を追加
+        if open_braces > close_braces:
+            json_str += '}' * (open_braces - close_braces)
+        if open_brackets > close_brackets:
+            json_str += ']' * (open_brackets - close_brackets)
+        
+        return json_str
     
     def get_usage(self, response: ChatCompletion) -> Dict[str, int]:
         """

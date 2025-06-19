@@ -8,6 +8,7 @@ AIが人間のように文章を読んで意味を理解しながら章・節を
 
 import logging
 import math
+import re
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 
@@ -184,21 +185,21 @@ class SegmenterAgent:
 重要：セグメントの境界は、文章が自然に区切れる位置に設定してください。
 「ために、」「そして、」などで始まる不完全な文章にならないよう注意してください。
 
-JSON形式で以下の情報を返してください：
-{
-    "book_title": "書籍タイトル（最初のチャンクのみ）",
-    "segments": [
-        {
-            "type": "chapter" or "section",
-            "title": "推定タイトル",
-            "start_pos_in_chunk": 文字位置,
-            "confidence": 0.0-1.0,
-            "reason": "判断理由",
-            "boundary_quality": "境界の品質評価"
-        }
-    ],
-    "content_summary": "このチャンクの内容要約"
-}"""
+以下の形式で情報を返してください：
+
+BOOK_TITLE: 書籍タイトル（最初のチャンクのみ）
+
+SEGMENTS:
+[SEGMENT_START]
+TYPE: chapter または section
+TITLE: 推定タイトル
+POSITION: 文字位置
+CONFIDENCE: 0.0-1.0
+REASON: 判断理由
+QUALITY: 境界の品質評価
+[SEGMENT_END]
+
+SUMMARY: このチャンクの内容要約"""
         
         user_prompt = f"""以下のテキストチャンク（{chunk_index+1}/{total_chunks}）を分析してください：
 
@@ -223,7 +224,17 @@ JSON形式で以下の情報を返してください：
                 temperature=0.2
             )
             
-            analysis = self.client.extract_json(response)
+            # テキスト形式のレスポンスを解析
+            response_text = self.client.extract_text(response)
+            analysis = self._parse_structured_response(response_text, chunk_text, chunk_index)
+            
+            # 必要なキーが存在しない場合のデフォルト値設定
+            if 'segments' not in analysis:
+                analysis['segments'] = []
+            if 'book_title' not in analysis:
+                analysis['book_title'] = ""
+            if 'content_summary' not in analysis:
+                analysis['content_summary'] = ""
             
             # セグメントの位置を絶対位置に変換
             if analysis.get('segments'):
@@ -231,16 +242,201 @@ JSON形式で以下の情報を返してください：
                     if 'start_pos_in_chunk' in segment:
                         segment['start_pos'] = chunk_start_pos + segment['start_pos_in_chunk']
                         segment['chunk_index'] = chunk_index
+                    
+                    # セグメントに必要なフィールドが不足している場合のデフォルト値
+                    if 'type' not in segment:
+                        segment['type'] = 'chapter'
+                    if 'title' not in segment:
+                        segment['title'] = f"セクション {chunk_index + 1}"
+                    if 'confidence' not in segment:
+                        segment['confidence'] = 0.5
+                    if 'reason' not in segment:
+                        segment['reason'] = "自動生成"
+                    if 'boundary_quality' not in segment:
+                        segment['boundary_quality'] = "medium"
             
             return analysis
             
         except Exception as e:
             logger.error(f"チャンク分析中にエラーが発生しました: {e}")
+            # フォールバック: 基本的な分析結果を返す
             return {
-                "book_title": "",
-                "segments": [],
-                "content_summary": ""
+                "book_title": "タイトル未設定" if chunk_index == 0 else "",
+                "segments": [{
+                    "type": "chapter",
+                    "title": f"セクション {chunk_index + 1}",
+                    "start_pos_in_chunk": 0,
+                    "start_pos": chunk_start_pos,
+                    "confidence": 0.3,
+                    "reason": "エラー時のフォールバック",
+                    "boundary_quality": "low",
+                    "chunk_index": chunk_index
+                }] if chunk_index % 2 == 0 else [],  # 偶数チャンクのみセグメント作成
+                "content_summary": f"チャンク {chunk_index + 1} の内容"
             }
+    
+    def _parse_structured_response(self, response_text: str, chunk_text: str, chunk_index: int) -> Dict[str, Any]:
+        """
+        構造化されたテキストレスポンスを解析する
+        
+        Args:
+            response_text: AIからのレスポンステキスト
+            chunk_text: 分析対象のチャンクテキスト
+            chunk_index: チャンクのインデックス
+            
+        Returns:
+            Dict[str, Any]: 解析結果
+        """
+        logger.debug("構造化テキストレスポンスを解析中...")
+        
+        # 初期化
+        book_title = ""
+        segments = []
+        content_summary = ""
+        
+        try:
+            # BOOK_TITLEを抽出
+            title_match = re.search(r'BOOK_TITLE:\s*(.+)', response_text)
+            if title_match:
+                book_title = title_match.group(1).strip()
+            
+            # SUMMARYを抽出
+            summary_match = re.search(r'SUMMARY:\s*(.+)', response_text, re.DOTALL)
+            if summary_match:
+                content_summary = summary_match.group(1).strip()
+            
+            # SEGMENTSを抽出
+            segment_pattern = r'\[SEGMENT_START\](.*?)\[SEGMENT_END\]'
+            segment_matches = re.findall(segment_pattern, response_text, re.DOTALL)
+            
+            for segment_text in segment_matches:
+                segment = {}
+                
+                # 各フィールドを抽出
+                type_match = re.search(r'TYPE:\s*(.+)', segment_text)
+                if type_match:
+                    segment['type'] = type_match.group(1).strip()
+                
+                title_match = re.search(r'TITLE:\s*(.+)', segment_text)
+                if title_match:
+                    segment['title'] = title_match.group(1).strip()
+                
+                position_match = re.search(r'POSITION:\s*(\d+)', segment_text)
+                if position_match:
+                    segment['start_pos_in_chunk'] = int(position_match.group(1))
+                
+                confidence_match = re.search(r'CONFIDENCE:\s*([\d.]+)', segment_text)
+                if confidence_match:
+                    segment['confidence'] = float(confidence_match.group(1))
+                
+                reason_match = re.search(r'REASON:\s*(.+)', segment_text)
+                if reason_match:
+                    segment['reason'] = reason_match.group(1).strip()
+                
+                quality_match = re.search(r'QUALITY:\s*(.+)', segment_text)
+                if quality_match:
+                    segment['boundary_quality'] = quality_match.group(1).strip()
+                
+                # 必要なフィールドが存在する場合のみ追加
+                if 'type' in segment and 'title' in segment:
+                    # デフォルト値を設定
+                    if 'start_pos_in_chunk' not in segment:
+                        segment['start_pos_in_chunk'] = 0
+                    if 'confidence' not in segment:
+                        segment['confidence'] = 0.5
+                    if 'reason' not in segment:
+                        segment['reason'] = "構造化解析による検出"
+                    if 'boundary_quality' not in segment:
+                        segment['boundary_quality'] = "medium"
+                    
+                    segments.append(segment)
+            
+            logger.debug(f"構造化解析完了: {len(segments)}個のセグメント検出")
+            
+        except Exception as e:
+            logger.warning(f"構造化レスポンス解析中にエラー: {e}")
+            # フォールバックとして従来の解析を実行
+            return self._fallback_text_analysis(response_text, chunk_text, chunk_index)
+        
+        # 結果が空の場合はフォールバック
+        if not segments and not book_title:
+            logger.warning("構造化解析で結果が得られませんでした。フォールバック解析を実行します")
+            return self._fallback_text_analysis(response_text, chunk_text, chunk_index)
+        
+        return {
+            "book_title": book_title,
+            "segments": segments,
+            "content_summary": content_summary
+        }
+    
+    def _fallback_text_analysis(self, response_text: str, chunk_text: str, chunk_index: int) -> Dict[str, Any]:
+        """
+        JSONパースに失敗した場合のフォールバック解析
+        
+        Args:
+            response_text: AIからのレスポンステキスト
+            chunk_text: 分析対象のチャンクテキスト
+            chunk_index: チャンクのインデックス
+            
+        Returns:
+            Dict[str, Any]: 解析結果
+        """
+        logger.info("フォールバック解析を実行中...")
+        
+        # レスポンステキストから情報を抽出
+        segments = []
+        book_title = ""
+        
+        # 章や節のキーワードを探す
+        chapter_keywords = ['第', '章', 'Chapter', 'CHAPTER', '■', '●', '◆']
+        section_keywords = ['節', 'Section', 'SECTION', '▼', '○', '◇']
+        
+        lines = chunk_text.split('\n')
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+                
+            # 章の検出
+            for keyword in chapter_keywords:
+                if keyword in line and len(line) < 100:  # タイトルは通常短い
+                    segments.append({
+                        "type": "chapter",
+                        "title": line,
+                        "start_pos_in_chunk": chunk_text.find(line),
+                        "confidence": 0.4,
+                        "reason": f"キーワード '{keyword}' による検出",
+                        "boundary_quality": "medium"
+                    })
+                    break
+            
+            # 節の検出
+            for keyword in section_keywords:
+                if keyword in line and len(line) < 100:
+                    segments.append({
+                        "type": "section",
+                        "title": line,
+                        "start_pos_in_chunk": chunk_text.find(line),
+                        "confidence": 0.3,
+                        "reason": f"キーワード '{keyword}' による検出",
+                        "boundary_quality": "medium"
+                    })
+                    break
+        
+        # 書籍タイトルの推定（最初のチャンクのみ）
+        if chunk_index == 0:
+            first_lines = chunk_text.split('\n')[:5]
+            for line in first_lines:
+                line = line.strip()
+                if line and len(line) < 50 and not any(kw in line for kw in chapter_keywords + section_keywords):
+                    book_title = line
+                    break
+        
+        return {
+            "book_title": book_title,
+            "segments": segments,
+            "content_summary": f"フォールバック解析によるチャンク {chunk_index + 1} の分析結果"
+        }
     
     def _optimize_segments(self, segments: List[Dict[str, Any]], text: str) -> List[StructureSegment]:
         """
